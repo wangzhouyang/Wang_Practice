@@ -1,0 +1,99 @@
+#!/usr/bin/perl
+# (c) 2016 Chao IN-HOURSE SHARE ONLY
+# Chao2 Estimate method
+# See Colwell 2009, Appendix B of EstimateS User’s Guide
+use strict;
+
+my $usage = "Usage: perl $0 <profile> [mode] [number] <output>
+		mode:  time  do [time] times in one thread
+			   seed  do 1 time with seed [seed]
+e.g.	perl $0 demo.gene.count.prof time 50 demo.gene.chao2
+";
+
+die "No sufficient argument.\n$usage" if @ARGV < 4;
+my ($input, $mode, $num, $output) = @ARGV;
+my ($seed, $time);
+if($mode eq "seed"){
+	$time = 1;
+}elsif($mode eq "time"){
+	$time = $num;
+}
+
+sub openFile {$_=shift;return(($_=~/\.gz$/)?"gzip -dc $_|":"<$_")}
+
+open IN,&openFile($input) or die $!."Can not access $input\n";
+open OT,"> $output" or die  $!."Can not access $output\n";
+
+my (%CHAO2, %ORDER);
+# %CHAO2 contains:
+# Sobs: obsered species/genes
+# Sest:	etimated number of species/genes
+# q0  : the number of undetected in the set of samples
+# q1  : the number of unique species
+# q2  : the number of duplicate species
+# Formula : Schao2 = Sest = Sobs + (1-1/m)(q1^2-q1)/(2q2 + 2)
+# m is sample number
+
+# %ORDER is randomly sample set order.
+chomp($_=<IN>);
+my @HEAD = split;
+#shift @HEAD;
+my $sampleNum = @HEAD;
+for(my $i=0;$i<$time;$i++){
+	$seed=($mode eq "seed")?$num:$i;
+	srand($seed);
+	my %MEM = ();
+	my $r = int(rand($sampleNum));
+	$ORDER{$i}{0} = $r;
+	$MEM{$r} ++;
+	for(my $j=1;$j<$sampleNum;$j++){
+		while(defined $MEM{$r}){$r = int(rand($sampleNum))}
+		$ORDER{$i}{$j} = $r;
+		$MEM{$r} ++;
+	}
+}
+
+
+	
+while(<IN>){
+	chomp;
+	my @counts = split/\t/;
+	shift @counts;
+	my %CT;
+	my $i=0;
+	while(@counts>0){
+		$CT{$i} = shift @counts;
+		$i++
+	}
+	for(my $i=0;$i<$time;$i++){
+		my $Sobs = 0;
+		for(my $j=0;$j<$sampleNum;$j++){
+			$Sobs += ($CT{$ORDER{$i}{$j}}>0)?1:0;
+			$CHAO2{$i}{$j}{Sobs} += ($Sobs >0)?1:0;
+			$CHAO2{$i}{$j}{q1}   += ($Sobs==1)?1:0;
+			$CHAO2{$i}{$j}{q2}   += ($Sobs==2)?1:0;
+		}
+	}
+	if($ARGV[4]){
+		print STDERR "$.\n";
+	}
+}
+close IN;
+for(my $i=0;$i<$time;$i++){
+	for(my $j=1;$j<$sampleNum;$j++){
+		my $Sobs = $CHAO2{$i}{$j}{Sobs};
+		my $q1   = $CHAO2{$i}{$j}{q1};
+		my $q2   = $CHAO2{$i}{$j}{q2};
+		my $Sest = $Sobs + (1 - 1/$sampleNum)*$q1*($q1-1)/($q2+1)/2;
+		if($mode eq "seed"){
+			print OT ($seed+1)."\t".($j+1)."\t$Sest\n";
+		}else{
+			print OT ($i+1)."\t".($j+1)."\t$Sest\n";
+		}
+	}
+}
+close OT;
+
+
+
+

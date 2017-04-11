@@ -1,0 +1,346 @@
+#!/usr/bin/perl -w
+use warnings;
+use strict;
+use Getopt::Long;
+use File::Basename;
+#use FindBin qw($Bin);
+use FindBin qw($RealBin);
+use Cwd 'abs_path';
+
+my $cwd = abs_path;
+my $Bin = $RealBin;
+my $cmd = basename $0;
+sub usage {
+	print <<USAGE;
+usage:
+	$cmd  <pe|se|config|cmd> [options]
+pattern
+	pe|se		pair end | single end
+    config      print default config file in cwd.
+    cmd         call sub scripts in bin directory.(annoProfile.pl)
+options:
+	-p|path		:[essential]sample path file (SampleID|fqID|fqPath)
+	-i|ins		:[essential for pair-end seq]insert info file
+	-s|step		:functions,default 1234
+					1	trim+filter
+					2	remove host genomic reads
+					3	soap mapping to microbiotic genomics
+					4	combine samples' abun into a single profile table
+	-o|outdir	:output directory path. Conatins the results and scripts.
+	-c|config	:provide a configure file including needed database and parameters for each setp, default below:
+					Qt  ||= 20		Qvalue for trim 
+					l   ||= 10	 	bp length for trim
+					N   ||= 1		tolerance number of N for filter
+					Qf  ||= 15	 	Qvalue for filter. The reads which more than half of the bytes lower than Qf will be discarded.
+					lf  ||= 0		left fq length. The minimum
+					q   ||= "st.q"		queue for qsub
+					P   ||= "st_ms"		Project id for qsub
+					pro ||= 8			process number for qsub
+					vf1 ||= "0.3G"		virtual free for qsub in step 1 (trim & filter)
+					vf2 ||= "8G"		virtual free for qsub in step 2 (remove host genes)
+					vf3 ||= "16G"		virtual free for qsub in step 3 (aligned to gene set)
+					vf4 ||= "10G"		virtual free for qsub in step 4 (calculate soap results to abundance)
+					m   ||= 99	 	job number submitted each for qsub
+					r   ||= 1		repeat time when job failed or interrupted
+	-h|help		:show help info
+	-v|version	:show version and author info.
+USAGE
+};
+
+my $pattern = $ARGV[0];
+print &usage && exit if (!defined $pattern);
+if($pattern eq "config"){
+    `cp $RealBin/default.cfg $cwd/`;
+    exit;
+}
+if ($pattern !~ /pe|se|config/){
+	my $path = ( -e "$Bin/bin/$pattern")?"$Bin/bin":( -e "$Bin/tools/$pattern")?"$Bin/tools":"No such script!.";
+    my $int = ($pattern=~/\.pl$/)?'perl ':($pattern=~/\.[Rr]$/)?'Rscript ':'';
+    print "$int$path/@ARGV\n";
+	if(system("$int$path/@ARGV")){
+		#die "ERR $?: $cmd $pattern failed!\n";
+		exit(1);
+	}else{
+		exit;
+	}
+}
+
+my($path_f,$ins_f,$step,$out_dir,$config,%CFG,$help,$version);
+GetOptions(
+    "p|path:s"    => \$path_f,
+    "i|ins:s"     => \$ins_f,
+    "s|step:s"    => \$step,
+    "o|outdir:s"  => \$out_dir,
+    "c|config:s"  => \$config,
+    "h|help:s"    => \$help,
+    "v|version:s" => \$version,
+);
+
+print &version && exit if defined $version;
+print &usage && exit if ( (!defined $path_f)||(defined $help) );
+
+
+# ####################
+# initialize variables
+# ####################
+$step    ||= "1234";
+$out_dir ||= $cwd; $out_dir = abs_path($out_dir);
+#$path_f = abs_path($path_f);
+#$ins_f = "SE" if $pattern =~ /se/i;
+#$ins_f  = abs_path($ins_f) if $ins_f ne "SE";
+$ins_f = "SE";
+
+if (defined $config){
+	if($config =~ /\.cfg$/){
+		open CFG,"$config" or die "failed to open configure file $config. $!\n";
+		while(<CFG>){chomp;next if $_ =~ /^#/;next if $_ eq "";
+			$_ =~ /^(\S+)\s*=\s*(\S+)/;
+			$CFG{$1} = $2;
+		}
+	}else{
+		foreach my $par (split(/,/,$config)){
+			my @a = split(/=/,$par);
+			$CFG{$a[0]} = $a[1];
+		}
+	}
+}
+$CFG{'min'} ||=0;
+$CFG{'max'} ||=1000;
+$CFG{'r'} ||= 0;
+$CFG{'s'} ||= 120;
+$CFG{"B"} ||= 0;
+
+# scripts under bin
+my $bin = "$Bin/bin";
+my $s_clean  = "readsFilter.dev.pl";
+my $s_SEclean= "OAs1";
+my $s_PEclean= "OAs1";
+my $s_rm     = "rmhost_v1.2.pl";
+my $s_soap   = "soap2BuildAbundance.dev.pl";
+my $s_abun   = "BuildAbundance.dev.pl";
+# public database prefix
+# project results directiory structure
+my $dir_s = $out_dir."/script";
+	my $dir_sI = $dir_s."/individual";
+	my $dir_sS = $dir_s."/samples";
+	my $dir_sB = $dir_s."/steps";
+my $dir_c = $out_dir."/clean";
+my $dir_r = $out_dir."/rmhost";
+my $dir_sp = $out_dir."/soap";
+my $dir_sA = $out_dir."/soapA";
+
+system "mkdir -p $dir_s" unless(-d $dir_s);
+	system "mkdir -p $dir_sI" unless(-d $dir_sI);
+	system "mkdir -p $dir_sS" unless(-d $dir_sS);
+	system "mkdir -p $dir_sB" unless(-d $dir_sB);
+system "mkdir -p $dir_c" unless(-d $dir_c or $step !~ /1/);
+system "mkdir -p $dir_r" unless(-d $dir_r or $step !~ /2/);
+system "mkdir -p $dir_sp" unless(-d $dir_sp or $step !~ /3/);
+system "mkdir -p $dir_sA" unless(-d $dir_sA or $step !~ /A/);
+
+
+my (%SAM,@samples,$tmp_out,$tmp_outN,$tmp_outQ);
+my @paths = split (',',$path_f);
+open PATH,"> $out_dir/sam.id.path" or die $!;
+while(@paths>0){
+	my $path_i = shift @paths;
+	$path_i = abs_path($path_i);
+	open IN,"<$path_i" or die "can not open $path_i, $!\n";
+	while (<IN>){
+		print PATH $_ ;
+		chomp;
+		my @a = split;
+		my ($sam,$pfx,$path) = @a;
+		push @{$SAM{$sam}{$pfx}}, $path;
+	}
+	close IN;
+}
+close PATH;
+###############################
+
+## start <- top exec batch scripts
+open C1,">$out_dir/RUN.batch.sh";
+print C1 "sh $dir_s/batch.clean.sh\n" if $step =~ /1/;
+print C1 "sh $dir_s/batch.rmhost.sh\n" if $step =~ /2/;
+print C1 "sh $dir_s/batch.soap.sh\n" if $step =~ /3/;
+print C1 "sh $dir_s/batch.abun.sh\n" if $step =~ /4/;
+close C1;
+## done! <- top exec batch scripts
+#
+## start <- contents of each batch scripts
+open M1,">$out_dir/RUN.qsubM.sh";
+print M1 "$cmd qsubM -d $dir_s/QSUBM.matrix_qsub -P $CFG{'P'} -q $CFG{'q'} -r $CFG{'r'} -s $CFG{'s'} $dir_s/QSUBM.matrix";
+close M1;
+open QSUBM,"> $dir_s/QSUBM.matrix";
+open C2,">$out_dir/RUN.linear.$step.sh";
+open B1,">$dir_s/batch.clean.sh";
+open B2,">$dir_s/batch.rmhost.sh";
+open B3,">$dir_s/batch.soap.sh";
+open B4,">$dir_s/batch.abun.sh";
+###############################
+foreach my $sam (sort keys %SAM){ # operation on sample level
+	### Write main batch scripts first.
+	print C2 "sh $dir_sS/$sam.$step.sh \&\n";
+	open LINE,"> $dir_sS/$sam.$step.sh";
+	if ($step =~ /1/){ 
+		open SSC,">$dir_sS/$sam.clean.sh";
+		if($CFG{'qsub'} =~ /on|1/){
+			$CFG{'f1'} ||= $CFG{'f'};
+			$CFG{'p1'} ||= $CFG{'p'};
+			print LINE &qsub($CFG{'f1'}, $CFG{'p1'}, $CFG{'q'}, $CFG{'P'}, "$dir_sS/$sam.clean.sh");
+		}else{
+			print LINE "sh $dir_sS/$sam.clean.sh\n";
+		}
+	}                              
+	if ($step =~ /2/){
+		open SSR,">$dir_sS/$sam.rmhost.sh";
+		if($CFG{'qsub'}  =~ /on|2/){
+			$CFG{'f2'} ||= $CFG{'f'};
+			$CFG{'p2'} ||= $CFG{'p'};
+			print LINE &qsub($CFG{'f2'}, $CFG{'p2'}, $CFG{'q'}, $CFG{'P'}, "$dir_sS/$sam.rmhost.sh");
+		}else{
+			print LINE "sh $dir_sS/$sam.rmhost.sh\n";
+		}
+	}                              
+	if ($step =~ /3/){             
+		open SSS,">$dir_sS/$sam.soap.sh";
+		open LIST,">$dir_sp/$sam.soap.list";
+		if($CFG{'qsub'}  =~ /on|3/){
+			$CFG{'f3'} ||= $CFG{'f'};
+			$CFG{'p3'} ||= $CFG{'p'};
+			print LINE &qsub($CFG{'f3'}, $CFG{'p3'}, $CFG{'q'}, $CFG{'P'}, "$dir_sS/$sam.soap.sh");
+		}else{
+	        print LINE "sh $dir_sS/$sam.soap.sh\n";
+		}
+	}
+	if ($step =~ /4/){
+		if($CFG{'qsub'}  =~ /on|4/){
+			$CFG{'f4'} ||= $CFG{'f'};
+			$CFG{'p4'} ||= $CFG{'p'};
+			print LINE &qsub($CFG{'f4'}, $CFG{'p4'}, $CFG{'q'}, $CFG{'P'}, "$dir_sS/$sam.abun.sh");
+		}else{
+	        print LINE "sh $dir_sS/$sam.abun.sh\n"; 
+		} 
+		print B4 "sh $dir_sS/$sam.abun.sh\n";
+	}
+	close LINE;                    
+
+	my $list ="";
+	my @FQS = sort keys %{$SAM{$sam}};
+	foreach my $pfx(sort keys %{$SAM{$sam}}){
+		my @fs = @{$SAM{$sam}{$pfx}};
+		our($fq1,$fq2,$fqS)=();;
+		$fq1 = $fs[0];
+		$tmp_out = $fq1;
+		if (@fs > 1){
+			$fq2 = $fs[1] or die "miss fq2 under pe pattern. $!\n";
+			if (@fs > 2){
+				$fqS = $fs[2];
+			}
+		}
+
+###############################
+		if ($step =~ /1/){
+			open SIC,">$dir_sI/$pfx.clean.sh";
+			my $seq = "";
+			if (@fs eq 2 ){
+				$seq = "$fq1,$fq2";
+				@fs = ("$dir_c/$pfx.clean.1.fq.gz","$dir_c/$pfx.clean.2.fq.gz","$dir_c/$pfx.clean.single.fq.gz");
+				print SIC "$cmd $s_PEclean $seq $dir_c/$pfx $CFG{'PhQ'} $CFG{'mLen'} $CFG{'seedOA'} $CFG{'fragOA'}\n";
+			}else{
+				$seq = $fq1;
+				$tmp_out = "$dir_c/$pfx.clean.fq.gz";
+				print SIC "$cmd $s_SEclean $seq $dir_c/$pfx $CFG{'PhQ'} $CFG{'mLen'} $CFG{'seedOA'} $CFG{'fragOA'}\n";
+			}
+			print B1 "sh $dir_sI/$pfx.clean.sh\n";
+			print SSC "sh $dir_sI/$pfx.clean.sh\n";
+			print QSUBM &qsubM($sam, 1, "sh $dir_sI/$pfx.clean.sh");
+			close SIC;
+		}
+###############################
+		if ($step =~ /2/){
+			open SIR,">$dir_sI/$pfx.rmhost.sh";
+			my $seq = "";
+			if (@fs > 1){
+				$seq = "-a $fs[0] -b $fs[1] -c $fs[2]";
+				@fs = ("$dir_r/$pfx.rmhost.1.fq.gz","$dir_r/$pfx.rmhost.2.fq.gz","$dir_r/$pfx.rmhost.single.fq.gz");
+			}else{
+				$seq = "-a $tmp_out";
+				$tmp_out = "$dir_r/$pfx.rmhost.fq.gz";
+			}
+			print SIR "$cmd $s_rm $seq -d $CFG{'db_host'} -D 4 -s 30 -r 1 -m $CFG{'min'} -x $CFG{'max'} -v 7 -i 0.9 -t $CFG{'p2'} -f Y -q 1 -p $dir_r/$pfx\n";
+			print B2 "sh $dir_sI/$pfx.rmhost.sh\n";
+			print SSR "sh $dir_sI/$pfx.rmhost.sh\n";
+			print QSUBM &qsubM($sam, 2, "sh $dir_sI/$pfx.rmhost.sh");
+			close SIR;
+		}
+###############################
+		if ($step =~ /3/){
+			open SIS,">$dir_sI/$pfx.soap.sh";
+			my $seq = "";
+			my $par = "m=$CFG{'min'},x=$CFG{'max'},r=2,l=30,M=4,S,p=$CFG{'p3'},v=5,S,c=0.95";
+			if (@fs > 1){
+				$seq = "-i1 $fs[0] -i2 $fs[1] -i3 $fs[2]";
+				$list .="$dir_sp/$sam.gene.build/$pfx.soap.pair.pe.gz\n";
+				$list .="$dir_sp/$sam.gene.build/$pfx.soap.pair.se.gz\n";
+				$list .="$dir_sp/$sam.gene.build/$pfx.soap.single.se.gz\n";
+			}else{
+				$seq = "-i1 $tmp_out";
+				$list .="$dir_sp/$sam.gene.build/$pfx.soap.SE.se.gz\n";
+			}
+			print SIS "$cmd $s_soap $seq -DB $CFG{'db_meta'} -par $par -o $dir_sp -s $sam -p $pfx &> $dir_sp/$sam.log\n";
+			print B3 "sh $dir_sI/$pfx.soap.sh\n";
+			print SSS "sh $dir_sI/$pfx.soap.sh\n";
+			print QSUBM &qsubM($sam, 3, "sh $dir_sI/$pfx.soap.sh");
+			close SIS;
+		}
+	}
+	if ($step =~ /3/){print LIST $list; close LIST;};
+	close SSC;
+    close SSR;
+    close SSS;
+
+	if ($step =~ /4/){ # Since step4 contains abundance building which needs operated on sample level, I've got to put them here.
+		open ABUN,">$dir_sS/$sam.abun.sh";
+		print QSUBM &qsubM($sam, 4, "sh $dir_sS/$sam.abun.sh");
+		print ABUN "$cmd $s_abun -ins $ins_f -gl $CFG{'RGL'} -l $dir_sp/$sam.soap.list -o $dir_sp -p $sam\n";
+		close ABUN;
+	}
+}
+close B1;
+close B2;
+close B3;
+close B4;
+print C2 "wait\n"; close C2;
+close QSUBM;
+## done! <- contents of each batch scripts
+open STAT,">$out_dir/report.stat.sh";
+print STAT "$cmd report.stat.pl sam.id.path ./ $step > REPORT.txt\n";
+close STAT;
+exit;
+# ####################
+# SUB FUNCTION
+# ####################
+sub version {
+	print <<VERSION;
+    version:    v0.15-dev
+    update:     20160111-20171117
+    author:     fangchao\@genomics.cn
+VERSION
+};
+sub qsub {
+	my $f = shift;
+	my $p = shift;
+	my $q  = shift;
+	my $P  = shift;
+	my $sh = shift;
+	my $base = basename($sh);
+	return("qsub_all.pl -l vf=$f,p=$p -q $q -P $P -d $sh\_qsub -N $base $sh\n")
+}
+sub qsubM {
+	my($N,$s,$sh) = @_;
+	my $B = ($CFG{"B$s"})?$CFG{"B$s"}:$CFG{"B"};
+	my $vf= ($CFG{"f$s"})?$CFG{"f$s"}:$CFG{"f"};
+	my $p = ($CFG{"p$s"})?$CFG{"p$s"}:$CFG{"p"};
+	return("N=$N TD=$s B=$B f=$vf p=$p $sh\n")
+}

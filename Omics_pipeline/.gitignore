@@ -1,0 +1,8 @@
+# ignore the following directories
+
+t/
+source/
+*test*
+*index*
+*tmp*
+
